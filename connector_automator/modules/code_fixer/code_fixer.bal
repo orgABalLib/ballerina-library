@@ -217,7 +217,7 @@ function extractTypeDefinition(string typesContent, string typeName) returns str
 }
 
 // Fix errors in a single file
-public function fixFileWithLLM(string projectPath, string filePath, CompilationError[] errors, boolean quietMode = false) returns FixResponse|error {
+public function fixFileWithLLM(string projectPath, string filePath, CompilationError[] errors, boolean quietMode = false, FixAttempt[] previousAttempts = []) returns FixResponse|error {
     if !quietMode {
         io:println(string `  Analyzing ${filePath} (${errors.length()} error${errors.length() == 1 ? "" : "s"})`);
     }
@@ -251,8 +251,11 @@ public function fixFileWithLLM(string projectPath, string filePath, CompilationE
         typeContext = getTypeContextForFile(projectPath, filePath, errors);
     }
 
-    // Create fix prompt with optional type context
-    string prompt = createFixPromptWithContext(fileContent, errors, filePath, typeContext);
+    // Build fix history context
+    string fixHistoryContext = buildFixHistoryContext(previousAttempts);
+
+    // Create fix prompt with optional type context and fix history
+    string prompt = createFixPromptWithHistory(fileContent, errors, filePath, typeContext, fixHistoryContext);
 
     // Get fix from LLM using centralized service
     string|error llmResponse = utils:callAI(prompt);
@@ -272,6 +275,41 @@ public function fixFileWithLLM(string projectPath, string filePath, CompilationE
         fixedCode: llmResponse,
         explanation: "Fixed using AI"
     };
+}
+
+// Build a context string from previous fix attempts
+function buildFixHistoryContext(FixAttempt[] attempts) returns string {
+    if attempts.length() == 0 {
+        return "";
+    }
+
+    string[] historyLines = [];
+    historyLines.push("PREVIOUS FIX ATTEMPTS (DO NOT REPEAT THESE - THEY FAILED):");
+
+    foreach FixAttempt attempt in attempts {
+        historyLines.push(string `
+Iteration ${attempt.iteration}:
+  Errors at that time: ${string:'join("; ", ...attempt.errorMessages)}
+  What was tried: ${attempt.appliedFix}
+  Result: FAILED (caused new/same errors)`);
+    }
+
+    return string:'join("\n", ...historyLines);
+}
+
+// Extract a brief description of what changed between two code versions
+function describeCodeChange(CompilationError[] errors) returns string {
+    // Create a brief summary of the errors being addressed
+    string[] summaries = [];
+    foreach CompilationError err in errors {
+        string shortMsg = err.message;
+        // Truncate long messages
+        if shortMsg.length() > 80 {
+            shortMsg = shortMsg.substring(0, 77) + "...";
+        }
+        summaries.push(string `Line ${err.line}: ${shortMsg}`);
+    }
+    return string:'join("; ", ...summaries);
 }
 
 // Apply fix to file
@@ -336,6 +374,9 @@ public function fixAllErrors(string projectPath, boolean quietMode = true, boole
     CompilationError[] previousErrors = [];
     int initialErrorCount = 0;
     boolean initialErrorCountSet = false;
+
+    // Track fix history per file to prevent oscillation
+    map<FixAttempt[]> fileFixHistory = {};
 
     if !quietMode {
         io:println("Starting error fixing process...");
@@ -429,8 +470,11 @@ public function fixAllErrors(string projectPath, boolean quietMode = true, boole
         foreach string filePath in errorsByFile.keys() {
             CompilationError[] fileErrors = errorsByFile.get(filePath);
 
-            // Get fix from LLM
-            FixResponse|error fixResponse = fixFileWithLLM(projectPath, filePath, fileErrors, quietMode);
+            // Get previous fix attempts for this file
+            FixAttempt[] previousAttempts = fileFixHistory.hasKey(filePath) ? fileFixHistory.get(filePath) : [];
+
+            // Get fix from LLM with history context
+            FixResponse|error fixResponse = fixFileWithLLM(projectPath, filePath, fileErrors, quietMode, previousAttempts);
             if fixResponse is error {
                 if !quietMode {
                     io:println(string `  ⚠  Could not generate fix for ${filePath}: ${fixResponse.message()}`);
@@ -438,6 +482,20 @@ public function fixAllErrors(string projectPath, boolean quietMode = true, boole
                 result.remainingFixes.push(string `Iteration ${iteration}: Failed to fix ${filePath}: ${fixResponse.message()}`);
                 continue;
             }
+
+            // Record this fix attempt in history
+            string[] errorMsgs = fileErrors.'map(function(CompilationError err) returns string {
+                return err.message;
+            });
+            FixAttempt thisAttempt = {
+                iteration: iteration,
+                errorMessages: errorMsgs,
+                appliedFix: describeCodeChange(fileErrors)
+            };
+            if !fileFixHistory.hasKey(filePath) {
+                fileFixHistory[filePath] = [];
+            }
+            fileFixHistory.get(filePath).push(thisAttempt);
 
             // Show fix to user and ask for confirmation
             boolean shouldApplyFix = false;

@@ -223,3 +223,117 @@ Now provide the complete corrected code following all rules above:
 `;
 }
 
+// Enhanced prompt with type context AND fix history to prevent oscillation
+public function createFixPromptWithHistory(string code, CompilationError[] errors, string filePath, string typeContext, string fixHistory) returns string {
+    // If no history, use the context-aware prompt
+    if fixHistory.length() == 0 {
+        return createFixPromptWithContext(code, errors, filePath, typeContext);
+    }
+
+    string errorContext = prepareErrorContext(errors);
+    string backTick = "`";
+    string tripleBacktick = "```";
+
+    string typeContextSection = "";
+    if typeContext.length() > 0 {
+        typeContextSection = string `
+<${typeContext}>
+`;
+    }
+
+    return string `
+You are an expert Ballerina language and compiler specialist with deep knowledge of API connector patterns, testing frameworks, and code generation best practices.
+
+<CONTEXT>
+This code was automatically generated for API connector testing/examples and contains compilation errors that need to be fixed while preserving the original intent and functionality.
+
+File: ${filePath}
+</CONTEXT>
+
+<COMPILATION_ERRORS>
+${errorContext}
+</COMPILATION_ERRORS>
+${typeContextSection}
+<CURRENT_CODE>
+${code}
+</CURRENT_CODE>
+
+<CRITICAL_FIX_HISTORY>
+**IMPORTANT**: Previous fix attempts for this file have FAILED. You must NOT repeat the same approaches.
+
+${fixHistory}
+
+**ANALYSIS OF FAILED PATTERNS**:
+If you see oscillation between these error patterns, apply the COMBINED fix:
+
+Pattern 1: "not a required field" or "invalid field access"
+  - This means you tried: ${backTick}response.fieldName${backTick} or ${backTick}response?.fieldName${backTick}
+  - This approach FAILED because the field is a rest field, not an explicit field
+
+Pattern 2: "incompatible types: expected 'SomeType?', found 'anydata'"
+  - This means you tried: ${backTick}response["fieldName"]${backTick}
+  - This approach FAILED because member access returns anydata
+
+**THE CORRECT COMBINED SOLUTION**:
+When BOTH patterns appear in history, you MUST use:
+${tripleBacktick}ballerina
+// For rest fields that return anydata, ALWAYS combine member access WITH type cast:
+string? fieldValue = <string?>response["fieldName"];
+
+// Or use ensureType for non-optional:
+string fieldValue = check response["fieldName"].ensureType();
+${tripleBacktick}
+
+DO NOT try ${backTick}response.field${backTick} again - it already failed.
+DO NOT try ${backTick}response["field"]${backTick} without cast - it already failed.
+You MUST use ${backTick}<ExpectedType?>response["field"]${backTick}
+</CRITICAL_FIX_HISTORY>
+
+<BALLERINA_FIELD_ACCESS_RULES>
+### Field Access - This is CRITICAL
+
+1. **For rest fields (NOT explicitly defined in record)**:
+   - WRONG: ${backTick}response.field${backTick} → "not a required field" error
+   - WRONG: ${backTick}response["field"]${backTick} → returns anydata, type mismatch
+   - CORRECT: ${backTick}<ExpectedType?>response["field"]${backTick}
+   - CORRECT: ${backTick}check response["field"].ensureType()${backTick}
+
+2. **For optional fields (defined with ?)**:
+   - Use: ${backTick}response?.field${backTick} or ${backTick}response.field${backTick} (if record allows)
+
+3. **For required fields (explicitly defined)**:
+   - Use: ${backTick}response.field${backTick}
+
+### Type Casting with Member Access
+When accessing a rest field, the return type is ${backTick}anydata${backTick}. You MUST cast:
+${tripleBacktick}ballerina
+// If expecting string?:
+string? status = <string?>response["status"];
+
+// If expecting int?:
+int? count = <int?>response["count"];
+
+// If expecting a record type:
+MyRecord? data = <MyRecord?>response["data"];
+${tripleBacktick}
+</BALLERINA_FIELD_ACCESS_RULES>
+
+<OUTPUT_REQUIREMENTS>
+Your response must contain ONLY the complete, corrected Ballerina source code that:
+- Resolves ALL compilation errors
+- DOES NOT repeat any fix that already failed (check the history above)
+- Uses the COMBINED approach (member access + type cast) for rest fields
+- Preserves original functionality and intent
+- Has correct import statements
+
+DO NOT include:
+- Markdown code blocks or ${tripleBacktick} tags
+- Any explanatory text or comments about fixes
+- Any content other than raw .bal file content
+</OUTPUT_REQUIREMENTS>
+
+Now provide the complete corrected code. Remember: DO NOT repeat failed approaches from the history.
+`;
+}
+
+
