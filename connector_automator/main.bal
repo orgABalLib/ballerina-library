@@ -643,106 +643,144 @@ function runRegenerationPipeline(string openApiSpec, string outputDir, string[] 
     boolean hadBuildErrors = utils:hasCompilationErrors(buildResult);
 
     if hadBuildErrors {
-        io:println("⚠  Initial build failed - likely due to test incompatibilities");
+        io:println("⚠  Initial build failed - likely due to test/mock incompatibilities");
         io:println("   This is expected for connector regeneration");
-        io:println("   Proceeding with smart test recovery...");
 
         if !quietMode && buildResult.stderr.length() > 0 {
             io:println("   Build errors:");
             io:println(buildResult.stderr);
         }
 
-        // Clean up old test files before regeneration
-        io:println("   Removing old test files for clean regeneration...");
-        utils:CommandResult cleanupResult = utils:executeCommand(
-            string `rm -rf tests modules/mock.server`,
-            clientPath,
-            quietMode
-        );
-        if cleanupResult.exitCode == 0 {
-            io:println("   ✓ Old tests removed");
+        // PHASE 1: Try to fix existing test files first (preserves test logic)
+        io:println("");
+        io:println("   Phase 1: Attempting to fix existing test files...");
+        io:println("   (This preserves existing test logic when possible)");
+
+        string[] fixerArgs = [clientPath];
+        if autoYes {
+            fixerArgs.push("yes");
+        }
+        if quietMode {
+            fixerArgs.push("quiet");
         }
 
-        // Step 4: Regenerate tests FIRST (before examples)
-        printStepHeader(4, "Regenerating Tests for New API Version", quietMode);
-        string[] testArgs = [outputDir, sanitizedSpec];
-        testArgs.push(...pipelineOptions);
-        error? testResult = test_generator:executeTestGen(...testArgs);
-        if testResult is error {
-            io:println(string `✗ Test regeneration failed: ${testResult.message()}`);
-            io:println("   Cannot continue without valid tests");
-            return testResult;
+        error? phase1FixResult = code_fixer:executeCodeFixer(...fixerArgs);
+        if phase1FixResult is error {
+            io:println(string `   ⚠  Phase 1 fix attempt encountered issues: ${phase1FixResult.message()}`);
         }
-        io:println("✓ Test regeneration completed successfully");
 
-        // Step 3 RETRY: Build and validate client again
-        printStepHeader(3, "Building and Validating Client (Retry)", quietMode);
-        utils:CommandResult retryBuildResult = utils:executeBalBuild(clientPath, quietMode);
+        // Check if Phase 1 fixed all errors
+        utils:CommandResult phase1BuildResult = utils:executeBalBuild(clientPath, quietMode);
 
-        if utils:hasCompilationErrors(retryBuildResult) {
-            io:println(string `✗ Build validation failed even after test regeneration`);
-            io:println("   Attempting additional code fixes...");
-
-            // Try code fixer one more time
-            string[] fixerArgs = [clientPath];
-            if autoYes {
-                fixerArgs.push("yes");
+        if !utils:hasCompilationErrors(phase1BuildResult) {
+            // Phase 1 succeeded - existing files were fixed
+            if phase1BuildResult.stderr.length() > 0 && !quietMode {
+                io:println("   ⚠  Build completed with warnings:");
+                io:println(phase1BuildResult.stderr);
             }
-            if quietMode {
-                fixerArgs.push("quiet");
-            }
+            io:println("   ✓ Phase 1 successful - existing test files fixed!");
+            io:println("✓ Client built and validated successfully after fixing existing tests");
 
-            error? fixResult = code_fixer:executeCodeFixer(...fixerArgs);
-            if fixResult is error {
-                io:println(string `⚠  Code fixer attempt failed: ${fixResult.message()}`);
-            }
-
-            // Final build attempt after code fixing
-            utils:CommandResult finalBuildResult = utils:executeBalBuild(clientPath, quietMode);
-
-            if utils:hasCompilationErrors(finalBuildResult) {
-                io:println(string `✗ Build still failing - manual intervention required`);
-
-                if !quietMode && finalBuildResult.stderr.length() > 0 {
-                    io:println("   Remaining build errors:");
-                    io:println(finalBuildResult.stderr);
-                }
-
-                io:println("");
-                io:println("⚠  REGENERATION COMPLETED WITH ERRORS");
-                io:println("   The connector has been partially regenerated but has compilation errors.");
-                io:println("   Common issues to check:");
-                io:println("   • Redeclared symbols in test files - remove duplicate type definitions");
-                io:println("   • Type mismatches - verify test data matches new schema");
-                io:println("   • Missing required fields - check new required fields in types");
-                io:println(string `   • Review errors in: ${clientPath}/tests/`);
-                io:println("");
-                io:println("   Continuing with documentation generation...");
+            // Continue to examples since tests are already working
+            printStepHeader(4, "Generating Examples", quietMode);
+            string[] exampleArgs = [outputDir];
+            exampleArgs.push(...pipelineOptions);
+            error? exampleResult = example_generator:executeExampleGen(...exampleArgs);
+            if exampleResult is error {
+                io:println(string `⚠  Example generation failed: ${exampleResult.message()}`);
+                io:println("   Continuing pipeline...");
             } else {
-                if finalBuildResult.stderr.length() > 0 && !quietMode {
-                    io:println("⚠  Build completed with warnings:");
-                    io:println(finalBuildResult.stderr);
-                }
-                io:println("✓ Client built successfully after code fixing");
+                io:println("✓ Example generation completed successfully");
             }
-        } else {
-            if retryBuildResult.stderr.length() > 0 && !quietMode {
-                io:println("⚠  Build completed with warnings:");
-                io:println(retryBuildResult.stderr);
-            }
-            io:println("✓ Client built and validated successfully after test regeneration");
-        }
 
-        // Step 5: Generate examples (after tests are fixed)
-        printStepHeader(5, "Regenerating Examples for New API Version", quietMode);
-        string[] exampleArgs = [outputDir];
-        exampleArgs.push(...pipelineOptions);
-        error? exampleResult = example_generator:executeExampleGen(...exampleArgs);
-        if exampleResult is error {
-            io:println(string `⚠  Example regeneration failed: ${exampleResult.message()}`);
-            io:println("   Continuing pipeline...");
         } else {
-            io:println("✓ Example regeneration completed successfully");
+            // PHASE 2: Phase 1 failed - remove old files and regenerate fresh
+            io:println("");
+            io:println("   Phase 1 could not fix all errors. Proceeding to Phase 2...");
+            io:println("   Phase 2: Removing old test files and regenerating fresh...");
+
+            utils:CommandResult cleanupResult = utils:executeCommand(
+                string `rm -rf tests modules/mock.server`,
+                clientPath,
+                quietMode
+            );
+            if cleanupResult.exitCode == 0 {
+                io:println("   ✓ Old tests removed");
+            }
+
+            // Regenerate tests from scratch
+            printStepHeader(4, "Regenerating Tests for New API Version", quietMode);
+            string[] testArgs = [outputDir, sanitizedSpec];
+            testArgs.push(...pipelineOptions);
+            error? testResult = test_generator:executeTestGen(...testArgs);
+            if testResult is error {
+                io:println(string `✗ Test regeneration failed: ${testResult.message()}`);
+                io:println("   Cannot continue without valid tests");
+                return testResult;
+            }
+            io:println("✓ Test regeneration completed successfully");
+
+            // Step 3 RETRY: Build and validate client again
+            printStepHeader(3, "Building and Validating Client (Retry)", quietMode);
+            utils:CommandResult retryBuildResult = utils:executeBalBuild(clientPath, quietMode);
+
+            if utils:hasCompilationErrors(retryBuildResult) {
+                io:println(string `✗ Build validation failed even after test regeneration`);
+                io:println("   Attempting additional code fixes...");
+
+                // Try code fixer one more time on regenerated files
+                error? fixResult = code_fixer:executeCodeFixer(...fixerArgs);
+                if fixResult is error {
+                    io:println(string `⚠  Code fixer attempt failed: ${fixResult.message()}`);
+                }
+
+                // Final build attempt after code fixing
+                utils:CommandResult finalBuildResult = utils:executeBalBuild(clientPath, quietMode);
+
+                if utils:hasCompilationErrors(finalBuildResult) {
+                    io:println(string `✗ Build still failing - manual intervention required`);
+
+                    if !quietMode && finalBuildResult.stderr.length() > 0 {
+                        io:println("   Remaining build errors:");
+                        io:println(finalBuildResult.stderr);
+                    }
+
+                    io:println("");
+                    io:println("⚠  REGENERATION COMPLETED WITH ERRORS");
+                    io:println("   The connector has been partially regenerated but has compilation errors.");
+                    io:println("   Common issues to check:");
+                    io:println("   • Redeclared symbols in test files - remove duplicate type definitions");
+                    io:println("   • Type mismatches - verify test data matches new schema");
+                    io:println("   • Missing required fields - check new required fields in types");
+                    io:println(string `   • Review errors in: ${clientPath}/tests/`);
+                    io:println("");
+                    io:println("   Continuing with documentation generation...");
+                } else {
+                    if finalBuildResult.stderr.length() > 0 && !quietMode {
+                        io:println("⚠  Build completed with warnings:");
+                        io:println(finalBuildResult.stderr);
+                    }
+                    io:println("✓ Client built successfully after code fixing");
+                }
+            } else {
+                if retryBuildResult.stderr.length() > 0 && !quietMode {
+                    io:println("⚠  Build completed with warnings:");
+                    io:println(retryBuildResult.stderr);
+                }
+                io:println("✓ Client built and validated successfully after test regeneration");
+            }
+
+            // Step 5: Generate examples (after tests are fixed)
+            printStepHeader(5, "Regenerating Examples for New API Version", quietMode);
+            string[] exampleArgs = [outputDir];
+            exampleArgs.push(...pipelineOptions);
+            error? exampleResult = example_generator:executeExampleGen(...exampleArgs);
+            if exampleResult is error {
+                io:println(string `⚠  Example regeneration failed: ${exampleResult.message()}`);
+                io:println("   Continuing pipeline...");
+            } else {
+                io:println("✓ Example regeneration completed successfully");
+            }
         }
 
     } else {
@@ -818,9 +856,10 @@ function printPipelineHeader(string openApiSpec, string outputDir, boolean quiet
         io:println("  1. Sanitize OpenAPI specification");
         io:println("  2. Generate Ballerina client");
         io:println("  3. Build and validate client (initial)");
-        io:println("  4. If build fails → Regenerate tests for new API");
-        io:println("     Then retry build validation");
-        io:println("  5. Regenerate examples for new API");
+        io:println("  4. If build fails:");
+        io:println("     Phase 1: Try to fix existing test files (preserves test logic)");
+        io:println("     Phase 2: If Phase 1 fails, regenerate tests from scratch");
+        io:println("  5. Generate/regenerate examples");
         io:println("  6. Generate documentation");
     } else {
         io:println("Pipeline Steps:");

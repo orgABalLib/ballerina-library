@@ -84,6 +84,138 @@ function prepareErrorContext(CompilationError[] errors) returns string {
     return string:'join("\n", ...errorStrings);
 }
 
+// Extract type names from error messages (e.g., "Type 'ReportCreationResponse'" -> "ReportCreationResponse")
+function extractTypeNamesFromErrors(CompilationError[] errors) returns string[] {
+    string[] typeNames = [];
+
+    foreach CompilationError err in errors {
+        string message = err.message;
+
+        // Pattern: 'TypeName' or "TypeName" in error messages
+        // Look for patterns like: type 'SomeType', record 'SomeType', etc.
+        regexp:RegExp typePattern = re `'([A-Z][a-zA-Z0-9]+)'`;
+        regexp:Span[] matches = typePattern.findAll(message);
+
+        foreach regexp:Span span in matches {
+            string matched = span.substring();
+            // Remove the quotes
+            string typeName = matched.substring(1, matched.length() - 1);
+            // Filter out common keywords that aren't types
+            if !isBalKeyword(typeName) && !containsTypeName(typeNames, typeName) {
+                typeNames.push(typeName);
+            }
+        }
+    }
+
+    return typeNames;
+}
+
+// Check if a string is a Ballerina keyword
+function isBalKeyword(string s) returns boolean {
+    string[] keywords = ["error", "nil", "string", "int", "boolean", "float", "decimal", "anydata", "json", "byte", "any"];
+    foreach string keyword in keywords {
+        if s.toLowerAscii() == keyword {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Check if type name already exists in array
+function containsTypeName(string[] arr, string typeName) returns boolean {
+    foreach string item in arr {
+        if item == typeName {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Get type context for fixing test/mock files
+function getTypeContextForFile(string projectPath, string filePath, CompilationError[] errors) returns string {
+    string typeContext = "";
+
+    // Extract type names mentioned in errors
+    string[] typeNames = extractTypeNamesFromErrors(errors);
+
+    if typeNames.length() == 0 {
+        return "";
+    }
+
+    // Try to read types.bal from the project
+    string typesFilePath = projectPath + "/types.bal";
+    string|io:Error typesContent = io:fileReadString(typesFilePath);
+
+    if typesContent is io:Error {
+        // Try mock.server types.bal if it's a mock file error
+        if filePath.includes("mock") {
+            typesFilePath = projectPath + "/modules/mock.server/types.bal";
+            typesContent = io:fileReadString(typesFilePath);
+        }
+    }
+
+    if typesContent is string {
+        // Extract relevant type definitions from types.bal
+        string[] relevantTypes = [];
+        foreach string typeName in typeNames {
+            string typeDefinition = extractTypeDefinition(typesContent, typeName);
+            if typeDefinition.length() > 0 {
+                relevantTypes.push(typeDefinition);
+            }
+        }
+
+        if relevantTypes.length() > 0 {
+            typeContext = "RELEVANT TYPE DEFINITIONS:\n" + string:'join("\n\n", ...relevantTypes);
+        }
+    }
+
+    return typeContext;
+}
+
+// Extract a single type definition from types.bal content
+function extractTypeDefinition(string typesContent, string typeName) returns string {
+    // Look for: public type TypeName record {
+    string pattern = "public type " + typeName;
+    int? startIdx = typesContent.indexOf(pattern);
+
+    if startIdx is () {
+        // Try without "public"
+        pattern = "type " + typeName;
+        startIdx = typesContent.indexOf(pattern);
+    }
+
+    if startIdx is int {
+        // Find the end of the type definition by counting braces
+        int braceCount = 0;
+        boolean foundOpenBrace = false;
+        int endIdx = startIdx;
+
+        foreach int i in startIdx ..< typesContent.length() {
+            string char = typesContent.substring(i, i + 1);
+            if char == "{" {
+                braceCount += 1;
+                foundOpenBrace = true;
+            } else if char == "}" {
+                braceCount -= 1;
+                if foundOpenBrace && braceCount == 0 {
+                    endIdx = i + 1;
+                    break;
+                }
+            }
+        }
+
+        if endIdx > startIdx {
+            // Include the semicolon if present
+            if endIdx < typesContent.length() && typesContent.substring(endIdx, endIdx + 1) == ";" {
+                endIdx += 1;
+            }
+            return typesContent.substring(startIdx, endIdx);
+        }
+    }
+
+    return "";
+}
+
 // Fix errors in a single file
 public function fixFileWithLLM(string projectPath, string filePath, CompilationError[] errors, boolean quietMode = false) returns FixResponse|error {
     if !quietMode {
@@ -113,8 +245,14 @@ public function fixFileWithLLM(string projectPath, string filePath, CompilationE
         return fileContent;
     }
 
-    // Create fix prompt
-    string prompt = createFixPrompt(fileContent, errors, filePath);
+    // Try to read types.bal for additional context when fixing test/mock files
+    string typeContext = "";
+    if filePath.includes("test") || filePath.includes("mock") {
+        typeContext = getTypeContextForFile(projectPath, filePath, errors);
+    }
+
+    // Create fix prompt with optional type context
+    string prompt = createFixPromptWithContext(fileContent, errors, filePath, typeContext);
 
     // Get fix from LLM using centralized service
     string|error llmResponse = utils:callAI(prompt);
